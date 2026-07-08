@@ -2,106 +2,69 @@
 // NH PRODUCTION — NHPRO_BILL v2.0.0
 // routes/license.js — Manajemen Lisensi (sisi NHPRO_BILL)
 // ============================================================
-'use strict';
+const express = require('express');
+const router = express.Router();
+const { getHardwareId, verifyLicense } = require('../services/license');
+const db = require('../config/db'); // Sesuaikan dengan instance DB Anda
 
-const router = require('express').Router();
-const { authMiddleware, requireAdmin } = require('../middleware/auth');
-const { query } = require('../config/db');
-const lic = require('../services/license');
-
-router.use(authMiddleware);
-
-// ── POST /api/license/activate ────────────────────────────────
-// Aktivasi lisensi: simpan key ke DB lalu hubungi license server
-router.post('/activate', requireAdmin, async (req, res) => {
-    let { license_key, license_server_url } = req.body || {};
-    license_key        = String(license_key || '').trim().toUpperCase();
-    license_server_url = String(license_server_url || '').trim().replace(/\/+$/, '');
-
-    if (!license_key)
-        return res.status(400).json({ error: 'Kunci lisensi wajib diisi.' });
-
-    try {
-        const hasil = await lic.aktivasi(license_key, license_server_url || null);
-        res.json({ ok: true, message: 'Lisensi berhasil diaktivasi!', ...hasil });
-    } catch (e) {
-        res.status(400).json({ error: e.message });
-    }
-});
-
-// ── POST /api/license/deactivate ──────────────────────────────
-// Deaktivasi lisensi (melepas HWID binding)
-router.post('/deactivate', requireAdmin, async (req, res) => {
-    try {
-        const hasil = await lic.deaktivasi();
-        res.json({ ok: true, message: 'Lisensi berhasil dideaktivasi.', ...hasil });
-    } catch (e) {
-        res.status(400).json({ error: e.message });
-    }
-});
-
-// ── GET /api/license/status ───────────────────────────────────
-// Status lisensi untuk panel admin
+/**
+ * @route   GET /api/license/status
+ * @desc    Mengecek status lisensi saat ini dan mengambil Hardware ID server client
+ */
 router.get('/status', async (req, res) => {
     try {
-        const force = req.query.reload === '1';
-        const s = await lic.status(force);
-        res.json(s);
-    } catch (e) {
-        res.status(500).json({ error: 'Gagal ambil status lisensi: ' + e.message });
+        const hwid = getHardwareId();
+        const [rows] = await db.query("SELECT license_key FROM settings WHERE id = 1 LIMIT 1");
+        const licenseKey = rows && rows[0] ? rows[0].license_key : null;
+        
+        const check = verifyLicense(licenseKey);
+        
+        return res.json({
+            status: 'success',
+            hardware_id: hwid,
+            has_license: !!licenseKey,
+            is_valid: check.valid,
+            reason: check.valid ? null : check.reason,
+            details: check.valid ? { client: check.client, expires: check.expires } : null
+        });
+    } catch (error) {
+        return res.status(500).json({ status: 'error', message: error.message });
     }
 });
 
-// ── GET /api/license/hwid ─────────────────────────────────────
-// Hardware ID mesin ini (untuk registrasi di License Server)
-router.get('/hwid', (req, res) => {
-    res.json({ hwid: lic.hwid() });
-});
-
-// ── POST /api/license/enforce ─────────────────────────────────
-// Toggle enforcement lisensi (superadmin only)
-router.post('/enforce', async (req, res) => {
-    if (!['superadmin'].includes(req.admin?.role))
-        return res.status(403).json({ error: 'Hanya superadmin.' });
-
-    const { aktif } = req.body || {};
-    try {
-        await query(
-            `INSERT INTO setting (kunci, nilai, deskripsi)
-             VALUES ('license_enforce', ?, 'Enforce lisensi: 1=ya, 0=tidak')
-             ON DUPLICATE KEY UPDATE nilai = VALUES(nilai)`,
-            [aktif ? '1' : '0']
-        );
-        res.json({
-            ok: true,
-            enforce: !!aktif,
-            message: aktif ? 'Lisensi sekarang diwajibkan.' : 'Lisensi tidak lagi diwajibkan.'
-        });
-    } catch (e) {
-        res.status(500).json({ error: 'Gagal update setting: ' + e.message });
+/**
+ * @route   POST /api/license/activate
+ * @desc    Menginput kode lisensi baru untuk mengaktifkan sistem NHPROBILL
+ */
+router.post('/activate', async (req, res) => {
+    const { license_key } = req.body;
+    
+    if (!license_key) {
+        return res.status(400).json({ status: 'error', message: 'Parameter license_key wajib diisi.' });
     }
-});
 
-// ── GET /api/license/server-info ──────────────────────────────
-// Cek koneksi ke license server
-router.get('/server-info', async (req, res) => {
-    const axios = require('axios');
+    // Lakukan validasi instan sebelum disimpan ke DB
+    const check = verifyLicense(license_key);
+    if (!check.valid) {
+        return res.status(400).json({ status: 'error', message: `Aktivasi Ditolak: ${check.reason}` });
+    }
+
     try {
-        const cfg = await lic.getConfig();
-        const resp = await axios.get(`${cfg.server}/api/health`, { timeout: 5000 });
-        res.json({
-            ok:        true,
-            reachable: true,
-            server:    cfg.server,
-            data:      resp.data,
+        // Simpan kode lisensi baru ke database settings
+        await db.query("UPDATE settings SET license_key = ? WHERE id = 1", [license_key]);
+        
+        return res.json({
+            status: 'success',
+            message: 'Sistem NHPROBILL Berhasil Diaktifkan! Terima kasih telah menggunakan produk resmi.',
+            details: {
+                client: check.client,
+                expires: check.expires
+            }
         });
-    } catch (e) {
-        const cfg = await lic.getConfig().catch(() => ({}));
-        res.json({
-            ok:        false,
-            reachable: false,
-            server:    cfg.server || 'unknown',
-            error:     e.message,
+    } catch (error) {
+        return res.status(500).json({ 
+            status: 'error', 
+            message: 'Gagal menulis lisensi ke database: ' + error.message 
         });
     }
 });
